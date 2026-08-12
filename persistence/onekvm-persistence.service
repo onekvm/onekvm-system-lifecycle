@@ -1,0 +1,13 @@
+[Unit]
+Description=Prepare OneKVM persistent storage
+After=local-fs.target
+Before=onekvm.service
+RequiresMountsFor=/mnt/storage
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/onekvm/prepare-persistence
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,119 @@
+#!/bin/sh
+set -eu
+
+slot=
+for argument in $(cat /proc/cmdline); do
+    case "$argument" in
+        rauc.slot=A) slot=A ;;
+        rauc.slot=B) slot=B ;;
+        onekvm.nfsroot=1) slot=dev ;;
+    esac
+done
+[ -n "$slot" ] || { echo "missing rauc.slot" >&2; exit 1; }
+
+data_root=/data/onekvm
+storage_root=/mnt/storage/onekvm
+config_root=$storage_root/config
+config_marker=$storage_root/.etc-migrated
+kernel_release=$(uname -r)
+module_updates=/usr/lib/modules/$kernel_release/updates
+persistent_module_updates=$storage_root/kernel-modules/$slot/$kernel_release/updates
+opkg_root=/data/pkg-state/slots/$slot/opkg
+baseline=/usr/share/onekvm/opkg-baseline
+
+mkdir -p /run/onekvm
+rm -rf /run/onekvm/opkg-gpg
+mkdir -p /run/onekvm/opkg-gpg
+chmod 0700 /run/onekvm/opkg-gpg
+cp -a /etc/opkg/gpg/. /run/onekvm/opkg-gpg/
+chmod 0600 /run/onekvm/opkg-gpg/pubring.kbx \
+    /run/onekvm/opkg-gpg/trustdb.gpg
+
+mkdir -p "$config_root"
+if [ ! -e "$config_marker" ]; then
+    if [ ! -L /etc/onekvm ] || [ "$(readlink /etc/onekvm)" != "$config_root" ]; then
+        cp -a /etc/onekvm/. "$config_root/"
+    fi
+    : >"$config_marker"
+fi
+rm -rf /etc/onekvm
+ln -s "$config_root" /etc/onekvm
+
+mkdir -p \
+    /var/log/onekvm \
+    /var/tmp/onekvm/extension-uploads \
+    "$data_root/apps" \
+    "$data_root/app-data/core" \
+    "$config_root/extensions" \
+    /data/pkg-state/opkg/lists \
+    /data/pkg-state/opkg/cache \
+    /data/rauc \
+    "$opkg_root"
+chmod 0700 "$config_root/extensions"
+chmod 0700 /var/tmp/onekvm /var/tmp/onekvm/extension-uploads
+
+if [ ! -e /etc/opkg/onekvm-feed.conf ]; then
+    cp /usr/share/onekvm/defaults/opkg/feeds.conf \
+        /etc/opkg/onekvm-feed.conf
+fi
+
+current_build_id=$(cat /usr/share/onekvm/build-id)
+slot_build_id=
+if [ -f "$opkg_root/.baseline-build-id" ]; then
+    slot_build_id=$(cat "$opkg_root/.baseline-build-id")
+fi
+
+if [ "$slot_build_id" != "$current_build_id" ]; then
+    rm -rf "$opkg_root"
+    mkdir -p "$opkg_root"
+    cp -a "$baseline/." "$opkg_root/"
+    cp /usr/share/onekvm/build-id "$opkg_root/.baseline-build-id"
+fi
+
+# Local IPKS bundles may contain optional kernel modules.  Their opkg state is
+# persistent, so their payload must not live only in the root overlay: an
+# image rewrite can replace that overlay while retaining userdata and leave
+# opkg reporting a package as installed even though its .ko files vanished.
+# Keep only the optional updates tree on userdata and isolate it by slot and
+# kernel release.  The immutable in-image module tree and ABI metadata remain
+# with each rootfs.  Synchronize only files owned by packages recorded in the
+# image baseline or this slot rather than copying arbitrary stale files from a
+# root overlay that may previously have been shared by both slots.
+mkdir -p "$module_updates" "$persistent_module_updates"
+if ! mountpoint -q "$module_updates"; then
+    # Seed modules shipped by the current immutable image as well as modules
+    # installed later by extension bundles.  Repeat the comparison on every
+    # boot because successive images can intentionally share uname -r.
+    for package_list in \
+        "$baseline"/info/onekvm-kernel-module-*.list \
+        "$opkg_root"/info/onekvm-kernel-module-*.list; do
+        [ -f "$package_list" ] || continue
+        while read -r installed_path _; do
+            case "$installed_path" in
+                "$module_updates"/*.ko)
+                    relative_path=${installed_path#"$module_updates"/}
+                    module_source=$installed_path
+                    # An opaque directory in the writable overlay can hide
+                    # modules in the newly booted immutable rootfs.  Prefer
+                    # /rofs whenever it contains this baseline module.
+                    if [ -f "/rofs$installed_path" ]; then
+                        module_source=/rofs$installed_path
+                    fi
+                    [ -f "$module_source" ] || continue
+                    module_destination=$persistent_module_updates/$relative_path
+                    if [ ! -f "$module_destination" ] || ! cmp -s "$module_source" "$module_destination"; then
+                        mkdir -p "$(dirname "$module_destination")"
+                        cp -a "$module_source" "$module_destination"
+                    fi
+                    ;;
+            esac
+        done <"$package_list"
+    done
+    mount --bind "$persistent_module_updates" "$module_updates"
+    if [ -n "$(find "$persistent_module_updates" -type f -name '*.ko' -print -quit)" ]; then
+        depmod -a "$kernel_release"
+    fi
+fi
+
+ln -sfn "$opkg_root" /run/onekvm/opkg
+printf '%s\n' "$slot" >/run/onekvm/slot
