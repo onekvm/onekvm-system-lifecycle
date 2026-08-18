@@ -1,0 +1,21 @@
+[Unit]
+Description=OneKVM process watchdog
+Documentation=file:///usr/share/doc
+After=dbus.socket onekvm.service
+Wants=dbus.socket
+ConditionKernelCommandLine=!onekvm.recovery
+ConditionKernelCommandLine=!onekvm.nfsroot=1
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/onekvm/onekvm-watchdog
+Restart=on-failure
+RestartSec=2s
+WatchdogSec=0
+# Stay out of the OneKVM slice so a wedged server cgroup cannot starve us.
+Slice=system.slice
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
