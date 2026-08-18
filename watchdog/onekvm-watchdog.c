@@ -38,7 +38,9 @@ struct watchdog {
 	unsigned reboot_window_sec;
 	unsigned reboot_limit;
 	uint64_t last_feed_ns;
+	uint64_t healthy_since_ns;
 	uint64_t last_sequence;
+	bool budget_cleared;
 	char dump_path[PATH_MAX];
 	char budget_path[PATH_MAX];
 };
@@ -50,15 +52,6 @@ static uint64_t monotonic_ns(void)
 	if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
 		return 0;
 	return (uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec;
-}
-
-static uint64_t wall_sec(void)
-{
-	struct timespec now;
-
-	if (clock_gettime(CLOCK_REALTIME, &now) != 0)
-		return 0;
-	return (uint64_t)now.tv_sec;
 }
 
 static void log_line(const char *message)
@@ -185,49 +178,89 @@ static int dump_server_stacks(const char *path)
 	return found >= 0 ? 0 : -1;
 }
 
-static unsigned count_recent_reboots(const char *path, uint64_t now, unsigned window_sec)
-{
-	FILE *file;
-	char line[64];
-	unsigned count = 0;
-
-	if (path == NULL || path[0] == '\0')
-		return 0;
-	file = fopen(path, "r");
-	if (file == NULL)
-		return 0;
-	while (fgets(line, sizeof(line), file) != NULL) {
-		unsigned long long stamp = 0;
-
-		if (sscanf(line, "%llu", &stamp) != 1)
-			continue;
-		if (now >= stamp && now - stamp <= window_sec)
-			count++;
-	}
-	fclose(file);
-	return count;
-}
-
-static int record_reboot(const char *path, uint64_t now)
+static int ensure_parent_dir(const char *path)
 {
 	char dir[PATH_MAX];
 	char *slash;
-	FILE *file;
 
 	if (path == NULL || path[0] == '\0')
 		return -1;
 	snprintf(dir, sizeof(dir), "%s", path);
 	slash = strrchr(dir, '/');
-	if (slash != NULL) {
-		*slash = '\0';
-		if (dir[0] != '\0' && mkdir(dir, 0755) != 0 && errno != EEXIST)
-			return -1;
+	if (slash == NULL)
+		return 0;
+	*slash = '\0';
+	if (dir[0] == '\0')
+		return 0;
+	if (mkdir(dir, 0755) != 0 && errno != EEXIST)
+		return -1;
+	return 0;
+}
+
+/* File holds one integer. Missing file is 0. Existing but unreadable is error. */
+static int load_reboot_count(const char *path, unsigned *count)
+{
+	FILE *file;
+	unsigned long value = 0;
+
+	if (path == NULL || path[0] == '\0' || count == NULL)
+		return -1;
+	file = fopen(path, "r");
+	if (file == NULL) {
+		if (errno == ENOENT) {
+			*count = 0;
+			return 0;
+		}
+		return -1;
 	}
-	file = fopen(path, "a");
+	if (fscanf(file, "%lu", &value) != 1) {
+		fclose(file);
+		return -1;
+	}
+	fclose(file);
+	if (value > 100)
+		return -1;
+	*count = (unsigned)value;
+	return 0;
+}
+
+static int store_reboot_count(const char *path, unsigned count)
+{
+	char tmp[PATH_MAX];
+	FILE *file;
+	int fd;
+
+	if (ensure_parent_dir(path) != 0)
+		return -1;
+	if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp))
+		return -1;
+	file = fopen(tmp, "w");
 	if (file == NULL)
 		return -1;
-	fprintf(file, "%" PRIu64 "\n", now);
-	fclose(file);
+	if (fprintf(file, "%u\n", count) < 0) {
+		fclose(file);
+		unlink(tmp);
+		return -1;
+	}
+	if (fflush(file) != 0) {
+		fclose(file);
+		unlink(tmp);
+		return -1;
+	}
+	fd = fileno(file);
+	if (fd >= 0 && fsync(fd) != 0) {
+		fclose(file);
+		unlink(tmp);
+		return -1;
+	}
+	if (fclose(file) != 0) {
+		unlink(tmp);
+		return -1;
+	}
+	if (rename(tmp, path) != 0) {
+		unlink(tmp);
+		return -1;
+	}
 	return 0;
 }
 
@@ -254,6 +287,8 @@ static int on_heartbeat(sd_bus_message *message, void *userdata, sd_bus_error *e
 	result = sd_bus_message_read(message, "t", &sequence);
 	if (result < 0)
 		return 0;
+	if (!watch->armed)
+		watch->healthy_since_ns = monotonic_ns();
 	watch->armed = true;
 	watch->last_sequence = sequence;
 	watch->last_feed_ns = monotonic_ns();
@@ -291,8 +326,16 @@ static int on_tick(sd_event_source *source, uint64_t usec, void *userdata)
 	if (now < watch->last_feed_ns)
 		return 0;
 	idle_ns = now - watch->last_feed_ns;
-	if (idle_ns < (uint64_t)watch->timeout_sec * 1000000000ull)
+	if (idle_ns < (uint64_t)watch->timeout_sec * 1000000000ull) {
+		if (!watch->budget_cleared &&
+		    now >= watch->healthy_since_ns &&
+		    now - watch->healthy_since_ns >=
+			    (uint64_t)watch->reboot_window_sec * 1000000000ull) {
+			if (store_reboot_count(watch->budget_path, 0) == 0)
+				watch->budget_cleared = true;
+		}
 		return 0;
+	}
 
 	snprintf(line, sizeof(line),
 		 "heartbeat timeout after %u s (last sequence %" PRIu64 ")",
@@ -310,13 +353,21 @@ static int on_tick(sd_event_source *source, uint64_t usec, void *userdata)
 		sd_event_exit(watch->event, 2);
 		return 0;
 	}
-	if (count_recent_reboots(watch->budget_path, wall_sec(), watch->reboot_window_sec)
-	    >= watch->reboot_limit) {
-		log_line("reboot budget exceeded; leaving the system running");
-		sd_event_exit(watch->event, 3);
-		return 0;
+	{
+		unsigned count = 0;
+
+		if (load_reboot_count(watch->budget_path, &count) != 0 ||
+		    count >= watch->reboot_limit) {
+			log_line("reboot budget exceeded; leaving the system running");
+			sd_event_exit(watch->event, 3);
+			return 0;
+		}
+		if (store_reboot_count(watch->budget_path, count + 1) != 0) {
+			log_line("failed to persist reboot budget; not rebooting");
+			sd_event_exit(watch->event, 3);
+			return 0;
+		}
 	}
-	(void)record_reboot(watch->budget_path, wall_sec());
 	log_line("sync && reboot -f");
 	force_reboot();
 	return 0;
@@ -331,7 +382,7 @@ static void usage(FILE *out)
 		"  --no-dump           skip /proc stack dump on timeout\n"
 		"  --no-reboot         do not reboot; exit 2 on timeout\n"
 		"  --dump-path PATH    stack dump file\n"
-		"  --budget-path PATH  reboot timestamp log\n"
+		"  --budget-path PATH  persistent reboot count file\n"
 		"  --reboot-limit N    max reboots in the window (default %d)\n"
 		"  --reboot-window N   reboot budget window seconds (default %d)\n",
 		DEFAULT_TIMEOUT_SEC, DEFAULT_REBOOT_LIMIT, DEFAULT_REBOOT_WINDOW_SEC);
