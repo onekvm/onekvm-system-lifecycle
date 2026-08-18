@@ -21,8 +21,8 @@
 	"path='/org/onekvm/Core1/Watchdog'," \
 	"interface='org.onekvm.Core1.Watchdog',member='Heartbeat'"
 
-#define DEFAULT_TIMEOUT_SEC 15
-#define DEFAULT_TICK_SEC 1
+#define DEFAULT_TIMEOUT_SEC 60
+#define DEFAULT_TICK_SEC 5
 #define DEFAULT_REBOOT_WINDOW_SEC 900
 #define DEFAULT_REBOOT_LIMIT 3
 #define DEFAULT_DUMP_PATH "/var/log/onekvm/watchdog-last.dump"
@@ -327,6 +327,7 @@ static void usage(FILE *out)
 	fprintf(out,
 		"Usage: onekvm-watchdog [options]\n"
 		"  --timeout-sec N     silence before timeout (default %d)\n"
+		"                      HDMI off / 0 capture FPS is not a timeout.\n"
 		"  --no-dump           skip /proc stack dump on timeout\n"
 		"  --no-reboot         do not reboot; exit 2 on timeout\n"
 		"  --dump-path PATH    stack dump file\n"

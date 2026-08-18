@@ -8,6 +8,8 @@ ConditionKernelCommandLine=!onekvm.nfsroot=1
 
 [Service]
 Type=simple
+# Timeout is 60s. Core emits Heartbeat at most every 10s. Capture FPS
+# and a blanked HDMI display are not watchdog inputs.
 ExecStart=/usr/libexec/onekvm/onekvm-watchdog
 Restart=on-failure
 RestartSec=2s
