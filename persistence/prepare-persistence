@@ -18,6 +18,9 @@ config_marker=$storage_root/.etc-migrated
 kernel_release=$(uname -r)
 module_updates=/usr/lib/modules/$kernel_release/updates
 persistent_module_updates=$storage_root/kernel-modules/$slot/$kernel_release/updates
+machines_root=$storage_root/machines
+machines_marker=$storage_root/.machines-migrated
+machines_mount=/var/lib/machines
 opkg_root=/data/pkg-state/slots/$slot/opkg
 baseline=/usr/share/onekvm/opkg-baseline
 
@@ -52,6 +55,19 @@ mkdir -p \
 chmod 0700 "$config_root/extensions"
 chmod 0700 /var/tmp/onekvm /var/tmp/onekvm/extension-uploads
 
+# The root filesystem itself uses overlayfs.  An mstack needs its writable
+# data and work directories on a native filesystem because overlayfs cannot
+# use another overlayfs mount as its upper layer.  Preserve existing machine
+# images by copying them once before hiding the old root-overlay directory.
+mkdir -p "$machines_mount" "$machines_root"
+if ! mountpoint -q "$machines_mount"; then
+    if [ ! -e "$machines_marker" ]; then
+        cp -a "$machines_mount/." "$machines_root/"
+        : >"$machines_marker"
+    fi
+    mount --bind "$machines_root" "$machines_mount"
+fi
+
 if [ ! -e /etc/opkg/onekvm-feed.conf ]; then
     cp /usr/share/onekvm/defaults/opkg/feeds.conf \
         /etc/opkg/onekvm-feed.conf
@@ -61,6 +77,30 @@ current_build_id=$(cat /usr/share/onekvm/build-id)
 slot_build_id=
 if [ -f "$opkg_root/.baseline-build-id" ]; then
     slot_build_id=$(cat "$opkg_root/.baseline-build-id")
+fi
+
+if [ "$slot_build_id" != "$current_build_id" ]; then
+    # The root overlay is shared by A/B slots, so an older package payload can
+    # hide a newer immutable file. Refresh only regular baseline files that
+    # differ; leave local content and the slot-aware module tree alone.
+    for package_list in "$baseline"/info/*.list; do
+        [ -f "$package_list" ] || continue
+        while read -r installed_path _; do
+            case "$installed_path" in
+                /usr/local/*|/usr/lib/modules/*)
+                    continue
+                    ;;
+                /usr/*)
+                    immutable_path=/rofs$installed_path
+                    [ -f "$immutable_path" ] || continue
+                    if [ ! -f "$installed_path" ] || ! cmp -s "$immutable_path" "$installed_path"; then
+                        mkdir -p "$(dirname "$installed_path")"
+                        cp -a "$immutable_path" "$installed_path"
+                    fi
+                    ;;
+            esac
+        done <"$package_list"
+    done
 fi
 
 if [ "$slot_build_id" != "$current_build_id" ]; then
