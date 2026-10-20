@@ -10,6 +10,9 @@ ConditionKernelCommandLine=!onekvm.nfsroot=1
 Type=simple
 # Timeout is 60s. Core emits Heartbeat at most every 10s. Capture FPS
 # and a blanked HDMI display are not watchdog inputs.
+# This process owns /dev/watchdog0 (not systemd RuntimeWatchdogSec).
+# systemctl stop → SIGTERM magic-closes DesignWare. Crash/SIGKILL leaves
+# it armed; Restart=on-failure reopens it, otherwise hardware resets.
 ExecStart=/usr/libexec/onekvm/onekvm-watchdog
 Restart=on-failure
 RestartSec=2s

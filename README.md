@@ -9,7 +9,13 @@ OneKVM targets. The watchdog listens for `org.onekvm.Core1.Watchdog.Heartbeat`
 every 10s. After 60s of silence it can dump `/proc` stacks and run
 `sync && reboot -f`. HDMI off or 0 capture FPS is not a hang. Reboot
 budget is a persistent counter (not wall-clock), because NanoKVM has
-no battery RTC.
+no battery RTC. The same process opens `/dev/watchdog0` and pings it
+every 5s (default hardware timeout 60s, at or below the DesignWare max
+so the kernel does not keep the hardware alive). `systemctl stop`
+magic-closes the device. Crash or SIGKILL leaves it armed. Do not set
+systemd `RuntimeWatchdogSec` (single-open).
+Hardware remains armed during an automatic `sync && reboot -f` so a stalled
+sync or reboot still has a hardware fallback.
 
 Machine-specific partition creation, first-boot migration, and hardware health
 checks remain in each machine support repository.

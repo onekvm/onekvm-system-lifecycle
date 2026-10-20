@@ -4,11 +4,16 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <linux/watchdog.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/resource.h>
+#include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <systemd/sd-bus.h>
@@ -22,6 +27,7 @@
 	"interface='org.onekvm.Core1.Watchdog',member='Heartbeat'"
 
 #define DEFAULT_TIMEOUT_SEC 60
+#define DEFAULT_HW_TIMEOUT_SEC 60
 #define DEFAULT_TICK_SEC 5
 #define DEFAULT_REBOOT_WINDOW_SEC 900
 #define DEFAULT_REBOOT_LIMIT 3
@@ -34,7 +40,10 @@ struct watchdog {
 	bool armed;
 	bool dump_stack;
 	bool reboot;
+	bool disarm_hw_only;
+	int hw_fd;
 	unsigned timeout_sec;
+	unsigned hw_timeout_sec;
 	unsigned reboot_window_sec;
 	unsigned reboot_limit;
 	uint64_t last_feed_ns;
@@ -57,6 +66,88 @@ static uint64_t monotonic_ns(void)
 static void log_line(const char *message)
 {
 	fprintf(stderr, "onekvm-watchdog: %s\n", message);
+}
+
+static int ping_hw(struct watchdog *watch)
+{
+	int dummy = 0;
+
+	if (watch == NULL || watch->hw_fd < 0)
+		return 0;
+	if (ioctl(watch->hw_fd, WDIOC_KEEPALIVE, &dummy) < 0) {
+		log_line("hw keepalive failed");
+		return -1;
+	}
+	return 0;
+}
+
+static void close_hw(struct watchdog *watch, bool magic)
+{
+	int flags = WDIOS_DISABLECARD;
+
+	if (watch == NULL || watch->hw_fd < 0)
+		return;
+	if (magic) {
+		if (ioctl(watch->hw_fd, WDIOC_SETOPTIONS, &flags) < 0)
+			log_line("WDIOC_SETOPTIONS WDIOS_DISABLECARD failed");
+		if (write(watch->hw_fd, "V", 1) != 1)
+			log_line("magic close write failed");
+	}
+	if (close(watch->hw_fd) != 0)
+		log_line("close /dev/watchdog failed");
+	watch->hw_fd = -1;
+	if (magic)
+		log_line("hardware watchdog disarmed");
+}
+
+static int arm_hw(struct watchdog *watch)
+{
+	static const char *const nodes[] = { "/dev/watchdog0", "/dev/watchdog" };
+	unsigned int timeout;
+	unsigned int i;
+	char line[96];
+
+	if (watch == NULL || watch->hw_fd >= 0)
+		return 0;
+	for (i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+		watch->hw_fd = open(nodes[i], O_WRONLY | O_CLOEXEC);
+		if (watch->hw_fd >= 0)
+			break;
+		if (errno == ENOENT || errno == ENODEV)
+			continue;
+		if (errno == EBUSY) {
+			log_line("hw watchdog busy (already owned)");
+			watch->hw_fd = -1;
+			return 0;
+		}
+		log_line("open /dev/watchdog failed");
+		watch->hw_fd = -1;
+		return -1;
+	}
+	if (watch->hw_fd < 0) {
+		log_line("no /dev/watchdog; hardware feeding disabled");
+		return 0;
+	}
+
+	timeout = watch->hw_timeout_sec;
+	if (ioctl(watch->hw_fd, WDIOC_SETTIMEOUT, &timeout) < 0)
+		log_line("WDIOC_SETTIMEOUT failed; using device default");
+	timeout = 0;
+	if (ioctl(watch->hw_fd, WDIOC_GETTIMEOUT, &timeout) == 0) {
+		if (timeout != watch->hw_timeout_sec) {
+			snprintf(line, sizeof(line),
+				 "hardware watchdog rounded timeout %u s -> %u s",
+				 watch->hw_timeout_sec, timeout);
+			log_line(line);
+		}
+		watch->hw_timeout_sec = timeout;
+		snprintf(line, sizeof(line), "feeding hardware watchdog timeout=%u s",
+			 timeout);
+		log_line(line);
+	} else {
+		log_line("feeding hardware watchdog");
+	}
+	return ping_hw(watch);
 }
 
 static int copy_proc_file(FILE *out, pid_t pid, const char *name)
@@ -320,7 +411,10 @@ static int on_tick(sd_event_source *source, uint64_t usec, void *userdata)
 	(void)usec;
 	if (source != NULL)
 		(void)arm_tick(source);
-	if (watch == NULL || !watch->armed)
+	if (watch == NULL)
+		return 0;
+	(void)ping_hw(watch);
+	if (!watch->armed)
 		return 0;
 	now = monotonic_ns();
 	if (now < watch->last_feed_ns)
@@ -350,6 +444,7 @@ static int on_tick(sd_event_source *source, uint64_t usec, void *userdata)
 	}
 	if (!watch->reboot) {
 		log_line("reboot disabled; exiting after timeout");
+		close_hw(watch, true);
 		sd_event_exit(watch->event, 2);
 		return 0;
 	}
@@ -359,17 +454,45 @@ static int on_tick(sd_event_source *source, uint64_t usec, void *userdata)
 		if (load_reboot_count(watch->budget_path, &count) != 0 ||
 		    count >= watch->reboot_limit) {
 			log_line("reboot budget exceeded; leaving the system running");
+			close_hw(watch, true);
 			sd_event_exit(watch->event, 3);
 			return 0;
 		}
 		if (store_reboot_count(watch->budget_path, count + 1) != 0) {
 			log_line("failed to persist reboot budget; not rebooting");
+			close_hw(watch, true);
 			sd_event_exit(watch->event, 3);
 			return 0;
 		}
 	}
 	log_line("sync && reboot -f");
+	(void)ping_hw(watch);
+	/* Keep hardware armed through sync/reboot, which can themselves hang.
+	 * O_CLOEXEC closes without magic on successful exec, leaving it armed. */
 	force_reboot();
+	return 0;
+}
+
+static int disarm_hw(void)
+{
+	struct watchdog watch = { .hw_fd = -1, .hw_timeout_sec = DEFAULT_HW_TIMEOUT_SEC };
+
+	if (arm_hw(&watch) != 0)
+		return 1;
+	close_hw(&watch, true);
+	return 0;
+}
+
+static int on_signal(sd_event_source *source, const struct signalfd_siginfo *info,
+		     void *userdata)
+{
+	struct watchdog *watch = userdata;
+
+	(void)source;
+	(void)info;
+	log_line("stop requested; disarming hardware watchdog");
+	close_hw(watch, true);
+	sd_event_exit(watch->event, 0);
 	return 0;
 }
 
@@ -377,23 +500,29 @@ static void usage(FILE *out)
 {
 	fprintf(out,
 		"Usage: onekvm-watchdog [options]\n"
-		"  --timeout-sec N     silence before timeout (default %d)\n"
+		"  --timeout-sec N     Core heartbeat silence before reboot -f (default %d)\n"
 		"                      HDMI off / 0 capture FPS is not a timeout.\n"
+		"  --hw-timeout-sec N  DesignWare timeout while this process feeds it (default %d)\n"
+		"                      Must stay <= hardware max so the kernel does not ping.\n"
 		"  --no-dump           skip /proc stack dump on timeout\n"
 		"  --no-reboot         do not reboot; exit 2 on timeout\n"
+		"  --disarm-hw         stop DesignWare WDT and exit (systemctl stop)\n"
 		"  --dump-path PATH    stack dump file\n"
 		"  --budget-path PATH  persistent reboot count file\n"
 		"  --reboot-limit N    max reboots in the window (default %d)\n"
 		"  --reboot-window N   reboot budget window seconds (default %d)\n",
-		DEFAULT_TIMEOUT_SEC, DEFAULT_REBOOT_LIMIT, DEFAULT_REBOOT_WINDOW_SEC);
+		DEFAULT_TIMEOUT_SEC, DEFAULT_HW_TIMEOUT_SEC,
+		DEFAULT_REBOOT_LIMIT, DEFAULT_REBOOT_WINDOW_SEC);
 }
 
 static int parse_args(struct watchdog *watch, int argc, char **argv)
 {
 	static const struct option options[] = {
 		{"timeout-sec", required_argument, NULL, 't'},
+		{"hw-timeout-sec", required_argument, NULL, 'T'},
 		{"no-dump", no_argument, NULL, 'D'},
 		{"no-reboot", no_argument, NULL, 'R'},
+		{"disarm-hw", no_argument, NULL, 'H'},
 		{"dump-path", required_argument, NULL, 'd'},
 		{"budget-path", required_argument, NULL, 'b'},
 		{"reboot-limit", required_argument, NULL, 'l'},
@@ -403,7 +532,7 @@ static int parse_args(struct watchdog *watch, int argc, char **argv)
 	};
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "t:h", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "t:T:h", options, NULL)) != -1) {
 		unsigned long value;
 		char *end = NULL;
 
@@ -414,11 +543,20 @@ static int parse_args(struct watchdog *watch, int argc, char **argv)
 				return -1;
 			watch->timeout_sec = (unsigned)value;
 			break;
+		case 'T':
+			value = strtoul(optarg, &end, 10);
+			if (end == optarg || *end != '\0' || value == 0 || value > 120)
+				return -1;
+			watch->hw_timeout_sec = (unsigned)value;
+			break;
 		case 'D':
 			watch->dump_stack = false;
 			break;
 		case 'R':
 			watch->reboot = false;
+			break;
+		case 'H':
+			watch->disarm_hw_only = true;
 			break;
 		case 'd':
 			if (snprintf(watch->dump_path, sizeof(watch->dump_path), "%s", optarg)
@@ -458,10 +596,13 @@ int main(int argc, char **argv)
 		.dump_stack = true,
 		.reboot = true,
 		.timeout_sec = DEFAULT_TIMEOUT_SEC,
+		.hw_timeout_sec = DEFAULT_HW_TIMEOUT_SEC,
+		.hw_fd = -1,
 		.reboot_window_sec = DEFAULT_REBOOT_WINDOW_SEC,
 		.reboot_limit = DEFAULT_REBOOT_LIMIT,
 	};
 	sd_event_source *timer = NULL;
+	sigset_t mask;
 	int result;
 
 	snprintf(watch.dump_path, sizeof(watch.dump_path), "%s", DEFAULT_DUMP_PATH);
@@ -470,6 +611,10 @@ int main(int argc, char **argv)
 		usage(stderr);
 		return 2;
 	}
+	if (watch.disarm_hw_only)
+		return disarm_hw();
+	if (setpriority(PRIO_PROCESS, 0, -10) != 0)
+		log_line("setpriority -10 failed");
 
 	result = sd_event_default(&watch.event);
 	if (result < 0) {
@@ -510,8 +655,33 @@ int main(int argc, char **argv)
 		log_line("enable timer failed");
 		return 1;
 	}
+	sigemptyset(&mask);
+	sigaddset(&mask, SIGTERM);
+	sigaddset(&mask, SIGINT);
+	if (sigprocmask(SIG_BLOCK, &mask, NULL) != 0) {
+		log_line("block SIGTERM/SIGINT failed");
+		close_hw(&watch, true);
+		return 1;
+	}
+	result = sd_event_add_signal(watch.event, NULL, SIGTERM, on_signal, &watch);
+	if (result < 0) {
+		log_line("add SIGTERM handler failed");
+		close_hw(&watch, true);
+		return 1;
+	}
+	result = sd_event_add_signal(watch.event, NULL, SIGINT, on_signal, &watch);
+	if (result < 0) {
+		log_line("add SIGINT handler failed");
+		close_hw(&watch, true);
+		return 1;
+	}
+	if (arm_hw(&watch) != 0) {
+		close_hw(&watch, true);
+		return 1;
+	}
 	log_line("waiting for org.onekvm.Core1.Watchdog.Heartbeat");
 	result = sd_event_loop(watch.event);
+	close_hw(&watch, true);
 	sd_event_source_unref(timer);
 	sd_bus_unref(watch.bus);
 	sd_event_unref(watch.event);
