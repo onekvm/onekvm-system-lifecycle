@@ -23,6 +23,8 @@ machines_marker=$storage_root/.machines-migrated
 machines_mount=/var/lib/machines
 opkg_root=/data/pkg-state/slots/$slot/opkg
 baseline=/usr/share/onekvm/opkg-baseline
+immutable_root=/mnt/.rofs
+[ -d "$immutable_root/usr" ] || immutable_root=/rofs
 
 mkdir -p /run/onekvm
 rm -rf /run/onekvm/opkg-gpg
@@ -91,7 +93,7 @@ if [ "$slot_build_id" != "$current_build_id" ]; then
                     continue
                     ;;
                 /usr/*)
-                    immutable_path=/rofs$installed_path
+                    immutable_path=$immutable_root$installed_path
                     [ -f "$immutable_path" ] || continue
                     if [ ! -f "$installed_path" ] || ! cmp -s "$immutable_path" "$installed_path"; then
                         mkdir -p "$(dirname "$installed_path")"
@@ -135,9 +137,9 @@ if ! mountpoint -q "$module_updates"; then
                     module_source=$installed_path
                     # An opaque directory in the writable overlay can hide
                     # modules in the newly booted immutable rootfs.  Prefer
-                    # /rofs whenever it contains this baseline module.
-                    if [ -f "/rofs$installed_path" ]; then
-                        module_source=/rofs$installed_path
+                    # the immutable root whenever it contains this baseline module.
+                    if [ -f "$immutable_root$installed_path" ]; then
+                        module_source=$immutable_root$installed_path
                     fi
                     [ -f "$module_source" ] || continue
                     module_destination=$persistent_module_updates/$relative_path
