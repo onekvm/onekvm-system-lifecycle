@@ -15,6 +15,9 @@ keepalive（默认硬件超时 60 秒，不超过 DesignWare 上限，避免内�
 
 机器专用的分区创建、首次启动迁移和硬件健康检查保留在对应机器支持仓库中。
 
+[临时 USB ADB](adb/README.md) 提供经过明确确认的本地调试，不依赖 Core 或网络。
+服务不随开机启动；调试期间暂停原本运行中的看门狗，清理时恢复。
+
 OpenEmbedded 配方仍保留在 `meta-onekvm` layer。
 
 ## 许可证

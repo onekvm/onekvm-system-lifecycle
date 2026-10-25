@@ -20,6 +20,10 @@ sync or reboot still has a hardware fallback.
 Machine-specific partition creation, first-boot migration, and hardware health
 checks remain in each machine support repository.
 
+[Temporary USB ADB](adb/README.md) provides explicitly confirmed local debugging
+without Core or network access. Its static service has no boot activation; it
+pauses an active watchdog during debugging and restores it on cleanup.
+
 The OpenEmbedded recipe remains in the `meta-onekvm` layer.
 
 ## License

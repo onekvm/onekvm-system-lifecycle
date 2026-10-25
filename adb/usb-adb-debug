@@ -1,0 +1,167 @@
+#!/bin/sh
+# Explicit local USB debugging. No network listener or persistent setting.
+set -eu
+gadget=/sys/kernel/config/usb_gadget/g1
+runtime=/run/onekvm-adb-debug
+ffs=/dev/usb-ffs/adb
+adb_pid=
+locked=0
+changed=0
+created=0
+mounted=0
+function_created=0
+udc=
+remaining=0
+mkdir -p "$runtime"
+exec 9>/run/onekvm-usb-gadget.lock
+lock() { if flock -w 10 9; then locked=1; else return 1; fi; }
+unlock() { flock -u 9; locked=0; }
+write_udc() { timeout 3 /bin/sh -c 'printf "%s\n" "$1" > "$2"' sh "$1" "$gadget/UDC"; }
+json_string() {
+    sed -n 's/^[[:space:]]*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$2" 2>/dev/null | head -n 1
+}
+speed() {
+    data=0
+    superspeed=1
+    for link in "$gadget"/configs/c.1/*; do
+        [ -L "$link" ] || continue
+        case "$(readlink "$link")" in
+            */hid.usb[0-3]) ;;
+            */mass_storage.usb0|*/uac1.usb0) data=1 ;;
+            *) data=1; superspeed=0 ;;
+        esac
+    done
+    maximum=$(cat "/sys/class/udc/$udc/maximum_speed" 2>/dev/null || :)
+    if [ "$data" = 0 ] || [ "$maximum" = full-speed ]; then
+        printf 'full-speed\n'
+    elif [ "$superspeed" = 1 ]; then
+        case "$maximum" in super-speed|super-speed-plus) printf '%s\n' "$maximum" ;; *) printf 'high-speed\n' ;; esac
+    else
+        printf 'high-speed\n'
+    fi
+}
+cleanup() {
+    result=$?
+    trap - EXIT INT TERM
+    set +e
+    cleanup_failed=0
+    if [ "$locked" = 0 ]; then lock || cleanup_failed=1; fi
+    if [ "$locked" = 1 ] && [ "$changed" = 1 ]; then
+        # Keep ep0 alive until the FunctionFS interface has left the gadget.
+        if [ -n "$(cat "$gadget/UDC" 2>/dev/null)" ]; then write_udc '' || cleanup_failed=1; fi
+        rm -f "$gadget/configs/c.1/zz_adb" || cleanup_failed=1
+        # Retain a newer Core/user identity if it changed during debugging.
+        if [ -f "$runtime/serial" ] && [ "$(cat "$gadget/strings/0x409/serialnumber")" = onekvm ]; then
+            cat "$runtime/serial" > "$gadget/strings/0x409/serialnumber" || cleanup_failed=1
+        fi
+        if [ -f "$runtime/product" ] && [ "$(cat "$gadget/strings/0x409/product")" = "$(cat "$runtime/debug-product")" ]; then
+            cat "$runtime/product" > "$gadget/strings/0x409/product" || cleanup_failed=1
+        fi
+        remaining=0
+        for link in "$gadget"/configs/c.1/*; do [ ! -L "$link" ] || remaining=1; done
+        if [ "$remaining" = 1 ]; then
+            speed > "$gadget/max_speed" || cleanup_failed=1
+            write_udc "$udc" || cleanup_failed=1
+        fi
+    fi
+    if [ -n "$adb_pid" ]; then kill "$adb_pid" 2>/dev/null; wait "$adb_pid" 2>/dev/null; fi
+    if [ "$locked" = 1 ] && [ "$mounted" = 1 ] && mountpoint -q "$ffs"; then umount "$ffs" || cleanup_failed=1; fi
+    if [ "$locked" = 1 ] && [ "$function_created" = 1 ] && [ -d "$gadget/functions/ffs.adb" ]; then
+        rmdir "$gadget/functions/ffs.adb" || cleanup_failed=1
+    fi
+    if [ "$locked" = 1 ] && [ "$created" = 1 ] && [ "$remaining" = 0 ]; then
+        rmdir "$gadget/configs/c.1/strings/0x409" "$gadget/configs/c.1" "$gadget/strings/0x409" "$gadget" 2>/dev/null
+    fi
+    rm -f "$runtime/ready"
+    if [ -f "$runtime/watchdog-paused" ]; then
+        if systemctl start --no-block onekvm-watchdog.service; then
+            rm -f "$runtime/watchdog-paused"
+        else
+            cleanup_failed=1
+        fi
+    fi
+    if [ "$cleanup_failed" = 0 ]; then rm -f "$runtime/owned" "$runtime/created" "$runtime/changed"; fi
+    if [ "$result" = 0 ] && [ "$cleanup_failed" != 0 ]; then result=1; fi
+    exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+if [ "${1:-}" = cleanup ]; then
+    [ -f "$runtime/owned" ] || exit 0
+    udc=$(cat "$runtime/owned")
+    created=$(cat "$runtime/created" 2>/dev/null || printf 0)
+    [ ! -f "$runtime/changed" ] || changed=1
+    mounted=1
+    function_created=1
+    exit 0
+fi
+[ "$#" = 0 ] || exit 2
+lock
+if ! mountpoint -q /sys/kernel/config; then mount -t configfs configfs /sys/kernel/config; fi
+for controller in /sys/class/udc/*; do
+    [ -e "$controller" ] || continue
+    udc=${controller##*/}
+    break
+done
+[ -n "$udc" ] || { echo 'No USB device controller available' >&2; exit 1; }
+machine=$(json_string machine /usr/share/onekvm/machine.json)
+model=$(json_string name /usr/share/onekvm/machine.json)
+variant=$(json_string variant_label /run/onekvm/hardware.json)
+[ -n "$variant" ] || variant=$(json_string variant_label /usr/share/onekvm/machine.json)
+[ -n "$machine" ] || machine=onekvm
+[ -n "$model" ] || model=Device
+[ -z "$variant" ] || model="$model $variant"
+if [ ! -d "$gadget" ]; then
+    mkdir -p "$gadget"
+    created=1
+    printf '0x18d1\n' > "$gadget/idVendor"
+    printf '0xd002\n' > "$gadget/idProduct"
+    printf '0x0200\n' > "$gadget/bcdUSB"
+    mkdir -p "$gadget/strings/0x409" "$gadget/configs/c.1/strings/0x409"
+    cat /etc/machine-id > "$gadget/strings/0x409/serialnumber"
+    printf 'OneKVM\n' > "$gadget/strings/0x409/manufacturer"
+    printf 'OneKVM USB Debug\n' > "$gadget/strings/0x409/product"
+    printf 'USB ADB debugging\n' > "$gadget/configs/c.1/strings/0x409/configuration"
+fi
+[ ! -L "$gadget/configs/c.1/zz_adb" ] || { echo 'ADB USB interface is already owned' >&2; exit 1; }
+[ ! -e "$ffs/ep0" ] || { echo 'ADB FunctionFS is already owned' >&2; exit 1; }
+[ ! -d "$gadget/functions/ffs.adb" ] || { echo 'ADB USB function is already owned' >&2; exit 1; }
+printf '%s\n' "$udc" > "$runtime/owned"
+printf '%s\n' "$created" > "$runtime/created"
+if systemctl is-active --quiet onekvm-watchdog.service; then
+    # Keep an explicitly requested debugging session alive if Core is stopped.
+    : > "$runtime/watchdog-paused"
+    systemctl stop onekvm-watchdog.service
+fi
+mkdir -p "$ffs" "$gadget/functions/ffs.adb" "$gadget/configs/c.1"
+function_created=1
+mount -t functionfs adb "$ffs"
+mounted=1
+# FunctionFS ep0 exists before adbd starts, selecting USB instead of its TCP fallback.
+[ -e "$ffs/ep0" ] || { echo 'ADB FunctionFS endpoint missing' >&2; exit 1; }
+env 'PROP_service.adb.tcp.port=0' 'PROP_persist.adb.tcp.port=0' \
+    'PROP_ro.product.name=OneKVM_Device' "PROP_ro.product.model=$model" \
+    "PROP_ro.product.device=$machine" SHELL=/bin/bash /usr/bin/adbd 9>&- &
+adb_pid=$!
+attempt=0
+while [ ! -e "$ffs/ep1" ]; do
+    kill -0 "$adb_pid" 2>/dev/null || { echo 'ADB daemon exited before USB became ready' >&2; exit 1; }
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 50 ] || { echo 'ADB USB endpoints timed out' >&2; exit 1; }
+    sleep 0.1
+done
+cat "$gadget/strings/0x409/serialnumber" > "$runtime/serial"
+cat "$gadget/strings/0x409/product" > "$runtime/product"
+printf 'OneKVM Device - %s\n' "$model" > "$runtime/debug-product"
+changed=1
+: > "$runtime/changed"
+if [ -n "$(cat "$gadget/UDC")" ]; then write_udc ''; fi
+printf 'onekvm\n' > "$gadget/strings/0x409/serialnumber"
+cat "$runtime/debug-product" > "$gadget/strings/0x409/product"
+ln -s "$gadget/functions/ffs.adb" "$gadget/configs/c.1/zz_adb"
+speed > "$gadget/max_speed"
+write_udc "$udc"
+: > "$runtime/ready"
+unlock
+systemd-notify --ready --status='USB ADB enabled until stopped or rebooted'
+wait "$adb_pid"

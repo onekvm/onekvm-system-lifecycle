@@ -1,6 +1,38 @@
 #!/bin/sh
 set -eu
 
+# Keep failure context in RAM even when userdata cannot be written. No logs or
+# credentials are copied here; the local screen can read this without Core.
+stage=boot-slot
+status_root=${ONEKVM_PERSISTENCE_STATUS_DIR:-/run/onekvm}
+write_status() {
+    (
+        umask 077
+        mkdir -p "$status_root"
+        printf 'state=%s\nstage=%s\nexit_code=%s\n' "$1" "$stage" "$2" \
+            >"$status_root/.persistence-status.tmp"
+        mv -f "$status_root/.persistence-status.tmp" "$status_root/persistence-status"
+    ) 2>/dev/null || :
+}
+progress() {
+    stage=$1
+    write_status running 0
+}
+on_exit() {
+    persistence_exit=$?
+    trap - EXIT
+    if [ "$persistence_exit" -eq 0 ]; then
+        stage=ready
+        write_status ready 0
+    else
+        write_status failed "$persistence_exit"
+        printf 'OneKVM persistence failed: stage=%s exit_code=%s\n' "$stage" "$persistence_exit" >&2 || :
+    fi
+    exit "$persistence_exit"
+}
+trap on_exit EXIT
+write_status running 0
+
 slot=
 for argument in $(cat /proc/cmdline); do
     case "$argument" in
@@ -26,14 +58,17 @@ baseline=/usr/share/onekvm/opkg-baseline
 immutable_root=/mnt/.rofs
 [ -d "$immutable_root/usr" ] || immutable_root=/rofs
 
+progress runtime
 mkdir -p /run/onekvm
 rm -rf /run/onekvm/opkg-gpg
 mkdir -p /run/onekvm/opkg-gpg
 chmod 0700 /run/onekvm/opkg-gpg
+progress package-keys
 cp -a /etc/opkg/gpg/. /run/onekvm/opkg-gpg/
 chmod 0600 /run/onekvm/opkg-gpg/pubring.kbx \
     /run/onekvm/opkg-gpg/trustdb.gpg
 
+progress config
 mkdir -p "$config_root"
 if [ ! -e "$config_marker" ]; then
     if [ ! -L /etc/onekvm ] || [ "$(readlink /etc/onekvm)" != "$config_root" ]; then
@@ -44,9 +79,8 @@ fi
 rm -rf /etc/onekvm
 ln -s "$config_root" /etc/onekvm
 
+progress data
 mkdir -p \
-    /var/log/onekvm \
-    /var/tmp/onekvm/extension-uploads \
     "$data_root/apps" \
     "$data_root/app-data/core" \
     "$config_root/extensions" \
@@ -55,12 +89,23 @@ mkdir -p \
     /data/rauc \
     "$opkg_root"
 chmod 0700 "$config_root/extensions"
-chmod 0700 /var/tmp/onekvm /var/tmp/onekvm/extension-uploads
+# /var/log and /var/tmp point into volatile storage. Its directories may
+# not exist until tmpfiles runs later in boot; mkdir cannot traverse a
+# dangling directory symlink. Leave their creation to that service then.
+progress volatile
+if [ -d /var/log ]; then
+    mkdir -p /var/log/onekvm
+fi
+if [ -d /var/tmp ]; then
+    mkdir -p /var/tmp/onekvm/extension-uploads
+    chmod 0700 /var/tmp/onekvm /var/tmp/onekvm/extension-uploads
+fi
 
 # The root filesystem itself uses overlayfs.  An mstack needs its writable
 # data and work directories on a native filesystem because overlayfs cannot
 # use another overlayfs mount as its upper layer.  Preserve existing machine
 # images by copying them once before hiding the old root-overlay directory.
+progress machines
 mkdir -p "$machines_mount" "$machines_root"
 if ! mountpoint -q "$machines_mount"; then
     if [ ! -e "$machines_marker" ]; then
@@ -75,6 +120,7 @@ if [ ! -e /etc/opkg/onekvm-feed.conf ]; then
         /etc/opkg/onekvm-feed.conf
 fi
 
+progress build-id
 current_build_id=$(cat /usr/share/onekvm/build-id)
 slot_build_id=
 if [ -f "$opkg_root/.baseline-build-id" ]; then
@@ -85,6 +131,7 @@ if [ "$slot_build_id" != "$current_build_id" ]; then
     # The root overlay is shared by A/B slots, so an older package payload can
     # hide a newer immutable file. Refresh only regular baseline files that
     # differ; leave local content and the slot-aware module tree alone.
+    progress image-files
     for package_list in "$baseline"/info/*.list; do
         [ -f "$package_list" ] || continue
         while read -r installed_path _; do
@@ -106,6 +153,7 @@ if [ "$slot_build_id" != "$current_build_id" ]; then
 fi
 
 if [ "$slot_build_id" != "$current_build_id" ]; then
+    progress packages
     rm -rf "$opkg_root"
     mkdir -p "$opkg_root"
     cp -a "$baseline/." "$opkg_root/"
@@ -121,6 +169,7 @@ fi
 # with each rootfs.  Synchronize only files owned by packages recorded in the
 # image baseline or this slot rather than copying arbitrary stale files from a
 # root overlay that may previously have been shared by both slots.
+progress modules
 mkdir -p "$module_updates" "$persistent_module_updates"
 if ! mountpoint -q "$module_updates"; then
     # Seed modules shipped by the current immutable image as well as modules
