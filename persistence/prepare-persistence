@@ -50,6 +50,18 @@ config_marker=$storage_root/.etc-migrated
 kernel_release=$(uname -r)
 module_updates=/usr/lib/modules/$kernel_release/updates
 persistent_module_updates=$storage_root/kernel-modules/$slot/$kernel_release/updates
+kernel_magic=
+if [ -f /usr/share/onekvm/kernel-magic ]; then
+    kernel_magic=$(cat /usr/share/onekvm/kernel-magic)
+    kernel_hash=${kernel_magic#sha256:}
+    case "$kernel_hash" in
+        ''|*[!0-9a-f]*) echo 'invalid image kernel magic' >&2; exit 1 ;;
+    esac
+    [ "$kernel_magic" = "sha256:$kernel_hash" ] && [ "${#kernel_hash}" -eq 64 ] || {
+        echo 'invalid image kernel magic' >&2; exit 1;
+    }
+    persistent_module_updates=$storage_root/kernel-modules/$slot/$kernel_release/$kernel_hash/updates
+fi
 machines_root=$storage_root/machines
 machines_marker=$storage_root/.machines-migrated
 machines_mount=/var/lib/machines
@@ -127,7 +139,11 @@ if [ -f "$opkg_root/.baseline-build-id" ]; then
     slot_build_id=$(cat "$opkg_root/.baseline-build-id")
 fi
 
-if [ "$slot_build_id" != "$current_build_id" ]; then
+slot_kernel_magic=
+if [ -f "$opkg_root/.baseline-kernel-magic" ]; then
+    slot_kernel_magic=$(cat "$opkg_root/.baseline-kernel-magic")
+fi
+if [ "$slot_build_id" != "$current_build_id" ] || [ "$slot_kernel_magic" != "$kernel_magic" ]; then
     # The root overlay is shared by A/B slots, so an older package payload can
     # hide a newer immutable file. Refresh only regular baseline files that
     # differ; leave local content and the slot-aware module tree alone.
@@ -152,12 +168,13 @@ if [ "$slot_build_id" != "$current_build_id" ]; then
     done
 fi
 
-if [ "$slot_build_id" != "$current_build_id" ]; then
+if [ "$slot_build_id" != "$current_build_id" ] || [ "$slot_kernel_magic" != "$kernel_magic" ]; then
     progress packages
     rm -rf "$opkg_root"
     mkdir -p "$opkg_root"
     cp -a "$baseline/." "$opkg_root/"
     cp /usr/share/onekvm/build-id "$opkg_root/.baseline-build-id"
+    printf '%s\n' "$kernel_magic" >"$opkg_root/.baseline-kernel-magic"
 fi
 
 # Local IPKS bundles may contain optional kernel modules.  Their opkg state is
@@ -179,6 +196,11 @@ if ! mountpoint -q "$module_updates"; then
         "$baseline"/info/onekvm-kernel-module-*.list \
         "$opkg_root"/info/onekvm-kernel-module-*.list; do
         [ -f "$package_list" ] || continue
+        if [ -n "$kernel_magic" ] && ! grep -Fxq \
+            "X-OneKVM-Kernel-Magic: $kernel_magic" "${package_list%.list}.control"; then
+            echo "Ignoring module package without matching kernel magic: $package_list" >&2
+            continue
+        fi
         while read -r installed_path _; do
             case "$installed_path" in
                 "$module_updates"/*.ko)
