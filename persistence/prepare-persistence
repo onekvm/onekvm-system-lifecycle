@@ -223,9 +223,9 @@ if ! mountpoint -q "$module_updates"; then
         done <"$package_list"
     done
     mount --bind "$persistent_module_updates" "$module_updates"
-    if [ -n "$(find "$persistent_module_updates" -type f -name '*.ko' -print -quit)" ]; then
-        depmod -a "$kernel_release"
-    fi
+    # The module-preparation unit validates indexes after staged package
+    # installation, before Core. Do not rebuild them unconditionally here:
+    # that invalidates its cache on every boot and duplicates the work.
 fi
 
 ln -sfn "$opkg_root" /run/onekvm/opkg
