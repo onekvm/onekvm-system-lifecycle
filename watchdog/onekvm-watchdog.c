@@ -175,13 +175,13 @@ static int copy_proc_file(FILE *out, pid_t pid, const char *name)
 	return 0;
 }
 
-static void dump_one_process(FILE *out, pid_t pid)
+static void dump_one_process(FILE *out, pid_t pid, const char *banner)
 {
 	char task_dir[64];
 	DIR *tasks;
 	struct dirent *entry;
 
-	fprintf(out, "===== onekvm-server pid %d =====\n", (int)pid);
+	fprintf(out, "===== %s pid %d =====\n", banner, (int)pid);
 	copy_proc_file(out, pid, "status");
 	copy_proc_file(out, pid, "wchan");
 	copy_proc_file(out, pid, "syscall");
@@ -209,7 +209,97 @@ static void dump_one_process(FILE *out, pid_t pid)
 	closedir(tasks);
 }
 
-static int dump_server_stacks(const char *path)
+static int task_is_disk_sleep(pid_t pid)
+{
+	char path[64];
+	char line[256];
+	FILE *file;
+	int disk = 0;
+
+	if (snprintf(path, sizeof(path), "/proc/%d/status", (int)pid) >= (int)sizeof(path))
+		return 0;
+	file = fopen(path, "r");
+	if (file == NULL)
+		return 0;
+	while (fgets(line, sizeof(line), file) != NULL) {
+		if (strncmp(line, "State:", 6) == 0) {
+			/* "State:\tD (disk sleep)". The word "disk" is lowercase. */
+			if (strchr(line, 'D') != NULL)
+				disk = 1;
+			break;
+		}
+	}
+	fclose(file);
+	return disk;
+}
+
+static void dump_disk_sleep(FILE *out)
+{
+	DIR *proc;
+	struct dirent *entry;
+	unsigned count = 0;
+
+	proc = opendir("/proc");
+	if (proc == NULL)
+		return;
+	fprintf(out, "===== D-state processes =====\n");
+	while ((entry = readdir(proc)) != NULL && count < 40) {
+		char comm_path[64];
+		char comm[64];
+		FILE *comm_file;
+		pid_t pid;
+
+		if (entry->d_name[0] < '1' || entry->d_name[0] > '9')
+			continue;
+		pid = (pid_t)atoi(entry->d_name);
+		if (pid <= 0 || !task_is_disk_sleep(pid))
+			continue;
+		if (snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", (int)pid)
+		    >= (int)sizeof(comm_path))
+			continue;
+		comm_file = fopen(comm_path, "r");
+		if (comm_file == NULL)
+			continue;
+		if (fgets(comm, sizeof(comm), comm_file) == NULL) {
+			fclose(comm_file);
+			continue;
+		}
+		fclose(comm_file);
+		comm[strcspn(comm, "\n")] = '\0';
+		if (strcmp(comm, "onekvm-server") == 0)
+			continue;
+		dump_one_process(out, pid, comm);
+		count++;
+	}
+	closedir(proc);
+	if (count == 0)
+		fprintf(out, "none\n");
+}
+
+static void write_stamp(FILE *out, const char *reason)
+{
+	struct timespec real;
+	FILE *uptime;
+	char buf[80];
+
+	fprintf(out, "onekvm-watchdog: %s\n", reason != NULL ? reason : "heartbeat timeout");
+	fprintf(out,
+		"Replaced only while this process still runs. "
+		"A CPU stuck in one MMIO load does not update this file; "
+		"the hardware watchdog resets the board instead.\n");
+	if (clock_gettime(CLOCK_REALTIME, &real) == 0) {
+		fprintf(out, "realtime: %lld.%09ld\n",
+			(long long)real.tv_sec, real.tv_nsec);
+	}
+	uptime = fopen("/proc/uptime", "r");
+	if (uptime != NULL) {
+		if (fgets(buf, sizeof(buf), uptime) != NULL)
+			fprintf(out, "uptime: %s", buf);
+		fclose(uptime);
+	}
+}
+
+static int dump_server_stacks(const char *path, const char *reason)
 {
 	DIR *proc;
 	struct dirent *entry;
@@ -230,6 +320,7 @@ static int dump_server_stacks(const char *path)
 	out = fopen(path, "w");
 	if (out == NULL)
 		return -1;
+	write_stamp(out, reason);
 	proc = opendir("/proc");
 	if (proc == NULL) {
 		fclose(out);
@@ -259,14 +350,28 @@ static int dump_server_stacks(const char *path)
 		fclose(comm_file);
 		if (strncmp(comm, "onekvm-server", 13) != 0)
 			continue;
-		dump_one_process(out, pid);
+		dump_one_process(out, pid, "onekvm-server");
 		found++;
 	}
 	closedir(proc);
 	if (found == 0)
 		fprintf(out, "no onekvm-server process found\n");
-	fclose(out);
-	return found >= 0 ? 0 : -1;
+	dump_disk_sleep(out);
+	if (fflush(out) != 0) {
+		fclose(out);
+		return -1;
+	}
+	{
+		int fd = fileno(out);
+
+		if (fd >= 0 && fsync(fd) != 0) {
+			fclose(out);
+			return -1;
+		}
+	}
+	if (fclose(out) != 0)
+		return -1;
+	return 0;
 }
 
 static int ensure_parent_dir(const char *path)
@@ -366,6 +471,114 @@ static void force_reboot(void)
 	_exit(1);
 }
 
+static int write_text(const char *path, const char *text)
+{
+	int fd;
+	size_t len;
+	ssize_t wrote;
+
+	fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	len = strlen(text);
+	wrote = write(fd, text, len);
+	if (close(fd) != 0)
+		return -1;
+	if (wrote < 0 || (size_t)wrote != len)
+		return -1;
+	return 0;
+}
+
+static void note_kmsg(const char *message)
+{
+	char line[192];
+	int fd;
+	size_t len;
+	ssize_t wrote;
+
+	if (snprintf(line, sizeof(line), "<2>onekvm-watchdog: %s\n", message)
+	    >= (int)sizeof(line))
+		return;
+	fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return;
+	len = strlen(line);
+	wrote = write(fd, line, len);
+	if (wrote < 0 || (size_t)wrote != len)
+		log_line("kmsg write failed");
+	if (close(fd) != 0)
+		log_line("kmsg close failed");
+}
+
+/* sysrq is often sync-only (16). Crash, task, and blocked-task keys need bit 0x8,
+ * and the value 1 enables every key. panic_sys_info makes panic() print stacks. */
+static void arm_panic_sysrq(void)
+{
+	if (write_text("/proc/sys/kernel/sysrq", "1\n") != 0)
+		log_line("failed to enable sysrq");
+	if (write_text("/proc/sys/kernel/panic_sys_info",
+		       "tasks,all_bt,blocked_tasks") != 0)
+		log_line("failed to set panic_sys_info");
+}
+
+static void sysrq_key(char key)
+{
+	char text[2];
+
+	text[0] = key;
+	text[1] = '\0';
+	if (write_text("/proc/sysrq-trigger", text) != 0)
+		log_line("sysrq trigger failed");
+}
+
+static int append_dmesg(const char *path)
+{
+	FILE *out;
+	FILE *in;
+	char buffer[512];
+	size_t n;
+	int fd;
+
+	out = fopen(path, "a");
+	if (out == NULL)
+		return -1;
+	fprintf(out, "===== dmesg =====\n");
+	in = popen("dmesg", "r");
+	if (in == NULL) {
+		fprintf(out, "dmesg failed: %s\n", strerror(errno));
+	} else {
+		while ((n = fread(buffer, 1, sizeof(buffer), in)) > 0) {
+			if (fwrite(buffer, 1, n, out) != n)
+				break;
+		}
+		if (pclose(in) != 0)
+			fprintf(out, "dmesg exit status non-zero\n");
+	}
+	if (fflush(out) != 0) {
+		fclose(out);
+		return -1;
+	}
+	fd = fileno(out);
+	if (fd >= 0 && fsync(fd) != 0) {
+		fclose(out);
+		return -1;
+	}
+	if (fclose(out) != 0)
+		return -1;
+	return 0;
+}
+
+static void trigger_kernel_panic(const char *reason)
+{
+	arm_panic_sysrq();
+	note_kmsg(reason);
+	log_line(reason);
+	/* panic() does not return. Hardware watchdog stays armed. */
+	sysrq_key('c');
+	log_line("sysrq panic returned; reboot -f");
+	force_reboot();
+}
+
 static int on_heartbeat(sd_bus_message *message, void *userdata, sd_bus_error *error)
 {
 	struct watchdog *watch = userdata;
@@ -432,12 +645,12 @@ static int on_tick(sd_event_source *source, uint64_t usec, void *userdata)
 	}
 
 	snprintf(line, sizeof(line),
-		 "heartbeat timeout after %u s (last sequence %" PRIu64 ")",
+		 "heartbeat timeout after %u s (last sequence %" PRIu64 "); kernel panic",
 		 watch->timeout_sec, watch->last_sequence);
 	log_line(line);
 
 	if (watch->dump_stack) {
-		if (dump_server_stacks(watch->dump_path) != 0)
+		if (dump_server_stacks(watch->dump_path, line) != 0)
 			log_line("failed to dump onekvm-server stacks");
 		else
 			log_line("wrote stack dump");
@@ -465,11 +678,19 @@ static int on_tick(sd_event_source *source, uint64_t usec, void *userdata)
 			return 0;
 		}
 	}
-	log_line("sync && reboot -f");
+	/* Dump file is already fsynced. panic=10 reboots after the trace.
+	 * A stalled panic, or a CPU stuck in one MMIO load, still expires
+	 * the hardware timer. That load cannot run this path. */
 	(void)ping_hw(watch);
-	/* Keep hardware armed through sync/reboot, which can themselves hang.
-	 * O_CLOEXEC closes without magic on successful exec, leaving it armed. */
-	force_reboot();
+	if (watch->dump_stack) {
+		arm_panic_sysrq();
+		sysrq_key('w');
+		sysrq_key('t');
+		sysrq_key('l');
+		if (append_dmesg(watch->dump_path) != 0)
+			log_line("failed to append dmesg");
+	}
+	trigger_kernel_panic(line);
 	return 0;
 }
 
@@ -500,12 +721,12 @@ static void usage(FILE *out)
 {
 	fprintf(out,
 		"Usage: onekvm-watchdog [options]\n"
-		"  --timeout-sec N     Core heartbeat silence before reboot -f (default %d)\n"
+		"  --timeout-sec N     Core heartbeat silence before kernel panic (default %d)\n"
 		"                      HDMI off / 0 capture FPS is not a timeout.\n"
 		"  --hw-timeout-sec N  DesignWare timeout while this process feeds it (default %d)\n"
 		"                      Must stay <= hardware max so the kernel does not ping.\n"
 		"  --no-dump           skip /proc stack dump on timeout\n"
-		"  --no-reboot         do not reboot; exit 2 on timeout\n"
+		"  --no-reboot         do not panic; exit 2 on timeout\n"
 		"  --disarm-hw         stop DesignWare WDT and exit (systemctl stop)\n"
 		"  --dump-path PATH    stack dump file\n"
 		"  --budget-path PATH  persistent reboot count file\n"

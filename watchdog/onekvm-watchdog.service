@@ -11,6 +11,10 @@ Type=simple
 # Timeout is 60s. Core emits Heartbeat at most every 10s. Capture FPS
 # and a blanked HDMI display are not watchdog inputs.
 # This process owns /dev/watchdog0 (not systemd RuntimeWatchdogSec).
+# Heartbeat timeout writes /var/log/onekvm/watchdog-last.dump and panics.
+# kernel.panic reboots about 10s later. Hardware stays armed if that
+# panic stalls. A CPU stuck in one MMIO load cannot panic; hardware
+# reset still happens and does not update the dump.
 # systemctl stop → SIGTERM magic-closes DesignWare. Crash/SIGKILL leaves
 # it armed; Restart=on-failure reopens it, otherwise hardware resets.
 ExecStart=/usr/libexec/onekvm/onekvm-watchdog
