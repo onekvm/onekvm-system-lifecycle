@@ -38,6 +38,9 @@ struct watchdog {
 	sd_event *event;
 	sd_bus *bus;
 	bool armed;
+	bool hardware_reset;
+	unsigned startup_timeout_sec;
+	uint64_t started_ns;
 	bool dump_stack;
 	bool reboot;
 	bool disarm_hw_only;
@@ -648,6 +651,11 @@ static int on_tick(sd_event_source *source, uint64_t usec, void *userdata)
 		 "heartbeat timeout after %u s (last sequence %" PRIu64 "); kernel panic",
 		 watch->timeout_sec, watch->last_sequence);
 	log_line(line);
+	if (watch->hardware_reset) {
+		/* NFS may be wedged: do not write a dump or enter software reboot. */
+		close_hw(watch, false);
+		_exit(4);
+	}
 
 	if (watch->dump_stack) {
 		if (dump_server_stacks(watch->dump_path, line) != 0)
@@ -721,6 +729,8 @@ static void usage(FILE *out)
 {
 	fprintf(out,
 		"Usage: onekvm-watchdog [options]\n"
+		"  --startup-timeout-sec N  deadline for the first Core heartbeat\n"
+		"  --hardware-reset    expire the hardware timer without panic or filesystem I/O\n"
 		"  --timeout-sec N     Core heartbeat silence before kernel panic (default %d)\n"
 		"                      HDMI off / 0 capture FPS is not a timeout.\n"
 		"  --hw-timeout-sec N  DesignWare timeout while this process feeds it (default %d)\n"
@@ -748,6 +758,8 @@ static int parse_args(struct watchdog *watch, int argc, char **argv)
 		{"budget-path", required_argument, NULL, 'b'},
 		{"reboot-limit", required_argument, NULL, 'l'},
 		{"reboot-window", required_argument, NULL, 'w'},
+		{"startup-timeout-sec", required_argument, NULL, 'S'},
+		{"hardware-reset", no_argument, NULL, 'X'},
 		{"help", no_argument, NULL, 'h'},
 		{NULL, 0, NULL, 0},
 	};
@@ -758,6 +770,16 @@ static int parse_args(struct watchdog *watch, int argc, char **argv)
 		char *end = NULL;
 
 		switch (opt) {
+		case 'X':
+			watch->hardware_reset = true;
+			break;
+		case 'S':
+			errno = 0;
+			value = strtoul(optarg, &end, 10);
+			if (errno || !end || end == optarg || *end || !value || value > 3600)
+				return -1;
+			watch->startup_timeout_sec = (unsigned)value;
+			break;
 		case 't':
 			value = strtoul(optarg, &end, 10);
 			if (end == optarg || *end != '\0' || value == 0 || value > 3600)
@@ -900,6 +922,7 @@ int main(int argc, char **argv)
 		close_hw(&watch, true);
 		return 1;
 	}
+	watch.started_ns = monotonic_ns();
 	log_line("waiting for org.onekvm.Core1.Watchdog.Heartbeat");
 	result = sd_event_loop(watch.event);
 	close_hw(&watch, true);
