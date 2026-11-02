@@ -630,9 +630,19 @@ static int on_tick(sd_event_source *source, uint64_t usec, void *userdata)
 	if (watch == NULL)
 		return 0;
 	(void)ping_hw(watch);
-	if (!watch->armed)
-		return 0;
 	now = monotonic_ns();
+	if (!watch->armed) {
+		if (!watch->startup_timeout_sec || now < watch->started_ns ||
+		    now - watch->started_ns < (uint64_t)watch->startup_timeout_sec * 1000000000ull)
+			return 0;
+		log_line("startup heartbeat deadline expired");
+		if (watch->hardware_reset) {
+			close_hw(watch, false);
+			_exit(4);
+		}
+		trigger_kernel_panic("startup heartbeat deadline expired");
+		return 0;
+	}
 	if (now < watch->last_feed_ns)
 		return 0;
 	idle_ns = now - watch->last_feed_ns;
@@ -920,6 +930,10 @@ int main(int argc, char **argv)
 	}
 	if (arm_hw(&watch) != 0) {
 		close_hw(&watch, true);
+		return 1;
+	}
+	if (watch.hardware_reset && watch.hw_fd < 0) {
+		log_line("hardware-reset mode requires exclusive ownership of a hardware watchdog");
 		return 1;
 	}
 	watch.started_ns = monotonic_ns();
