@@ -41,6 +41,13 @@ for argument in $(cat /proc/cmdline); do
         onekvm.nfsroot=1) slot=dev ;;
     esac
 done
+# Go keeps its factory bootloader; its initramfs publishes the selected root.
+# The marker is created before switch_root in the root-owned runtime tmpfs.
+if [ "$(cat /usr/share/onekvm/machine 2>/dev/null)" = nanokvm-go ] &&
+   [ -r /run/onekvm/boot-slot ]; then
+    IFS= read -r slot </run/onekvm/boot-slot
+    case "$slot" in A|dev) ;; *) echo "invalid Go boot slot" >&2; exit 1 ;; esac
+fi
 [ -n "$slot" ] || { echo "missing rauc.slot" >&2; exit 1; }
 
 data_root=/data/onekvm
