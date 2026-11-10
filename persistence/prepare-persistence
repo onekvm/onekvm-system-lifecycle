@@ -150,7 +150,15 @@ slot_kernel_magic=
 if [ -f "$opkg_root/.baseline-kernel-magic" ]; then
     slot_kernel_magic=$(cat "$opkg_root/.baseline-kernel-magic")
 fi
-if [ "$slot_build_id" != "$current_build_id" ] || [ "$slot_kernel_magic" != "$kernel_magic" ]; then
+# These markers live only in the overlay upper. The initramfs writes them after
+# retiring every image-owned upper entry, so lower files are already visible.
+upper_refreshed=false
+if [ "$(cat /.onekvm-image-build-id 2>/dev/null)" = "$current_build_id" ] &&
+   [ "$(cat /.onekvm-kernel-magic 2>/dev/null)" = "$kernel_magic" ]; then
+    upper_refreshed=true
+fi
+if [ "$upper_refreshed" = false ] &&
+   { [ "$slot_build_id" != "$current_build_id" ] || [ "$slot_kernel_magic" != "$kernel_magic" ]; }; then
     # The root overlay is shared by A/B slots, so an older package payload can
     # hide a newer immutable file. Refresh only regular baseline files that
     # differ; leave local content and the slot-aware module tree alone.
