@@ -28,6 +28,7 @@
 
 #define DEFAULT_TIMEOUT_SEC 60
 #define DEFAULT_HW_TIMEOUT_SEC 60
+#define HARDWARE_RESET_SEC 1
 #define DEFAULT_TICK_SEC 5
 #define DEFAULT_REBOOT_WINDOW_SEC 900
 #define DEFAULT_REBOOT_LIMIT 3
@@ -103,6 +104,33 @@ static void close_hw(struct watchdog *watch, bool magic)
 		log_line("hardware watchdog disarmed");
 }
 
+/* A previous owner's magic close can leave the kernel's release flag set when
+ * it disabled the timer first; the next close would then stop the timer
+ * instead of letting it reset. Any write without 'V' clears the flag. */
+static void forget_magic_close(struct watchdog *watch)
+{
+	if (write(watch->hw_fd, "", 1) != 1)
+		log_line("clearing magic close failed");
+}
+
+/* Hardware-reset mode: reset now instead of after the whole feeding timeout. */
+static void expire_hw(struct watchdog *watch)
+{
+	unsigned int timeout = HARDWARE_RESET_SEC;
+	char line[64];
+
+	if (watch == NULL || watch->hw_fd < 0)
+		return;
+	forget_magic_close(watch);
+	if (ioctl(watch->hw_fd, WDIOC_SETTIMEOUT, &timeout) < 0) {
+		log_line("WDIOC_SETTIMEOUT failed; hardware reset after the armed timeout");
+	} else {
+		snprintf(line, sizeof(line), "hardware reset in %u s", timeout);
+		log_line(line);
+	}
+	close_hw(watch, false);
+}
+
 static int arm_hw(struct watchdog *watch)
 {
 	static const char *const nodes[] = { "/dev/watchdog0", "/dev/watchdog" };
@@ -132,6 +160,7 @@ static int arm_hw(struct watchdog *watch)
 		return 0;
 	}
 
+	forget_magic_close(watch);
 	timeout = watch->hw_timeout_sec;
 	if (ioctl(watch->hw_fd, WDIOC_SETTIMEOUT, &timeout) < 0)
 		log_line("WDIOC_SETTIMEOUT failed; using device default");
@@ -637,7 +666,7 @@ static int on_tick(sd_event_source *source, uint64_t usec, void *userdata)
 			return 0;
 		log_line("startup heartbeat deadline expired");
 		if (watch->hardware_reset) {
-			close_hw(watch, false);
+			expire_hw(watch);
 			_exit(4);
 		}
 		trigger_kernel_panic("startup heartbeat deadline expired");
@@ -663,7 +692,7 @@ static int on_tick(sd_event_source *source, uint64_t usec, void *userdata)
 	log_line(line);
 	if (watch->hardware_reset) {
 		/* NFS may be wedged: do not write a dump or enter software reboot. */
-		close_hw(watch, false);
+		expire_hw(watch);
 		_exit(4);
 	}
 
@@ -740,7 +769,7 @@ static void usage(FILE *out)
 	fprintf(out,
 		"Usage: onekvm-watchdog [options]\n"
 		"  --startup-timeout-sec N  deadline for the first Core heartbeat\n"
-		"  --hardware-reset    expire the hardware timer without panic or filesystem I/O\n"
+		"  --hardware-reset    reset through the hardware timer within 1 s, without panic or filesystem I/O\n"
 		"  --timeout-sec N     Core heartbeat silence before kernel panic (default %d)\n"
 		"                      HDMI off / 0 capture FPS is not a timeout.\n"
 		"  --hw-timeout-sec N  DesignWare timeout while this process feeds it (default %d)\n"
