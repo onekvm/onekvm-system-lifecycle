@@ -7,7 +7,7 @@ for mode,stage in [('slot','boot-slot'),('keys','package-keys'),('config','confi
  with tempfile.TemporaryDirectory(prefix='onekvm-persistence-test-') as scratch:
   env={**os.environ,'ONEKVM_PERSISTENCE_STATUS_DIR':scratch,'PERSIST_TEST_MODE':mode}
   stubs=r'''
-cat() { if [ "$1" = /proc/cmdline ]; then [ "$PERSIST_TEST_MODE" = slot ] || printf 'rauc.slot=A\n'; else return 97; fi; }
+cat() { return 97; }
 uname() { printf 'test-kernel\n'; }
 mkdir() {
  case "$*" in *"$ONEKVM_PERSISTENCE_STATUS_DIR"*) command mkdir "$@";; *'/mnt/storage/onekvm/config'*) return 73;; *) :;; esac
@@ -18,7 +18,13 @@ rm() { :; }
 mv() { case "$*" in *"$ONEKVM_PERSISTENCE_STATUS_DIR"*) command mv "$@";; *) return 98;; esac; }
 . "$1"
 '''
-  p=subprocess.run(['/bin/bash','-c',stubs,'status-test',str(SCRIPT.resolve())],env=env,capture_output=True,text=True)
+  cmdline=Path(scratch)/'cmdline'
+  cmdline.write_text('' if mode=='slot' else 'rauc.slot=A\n')
+  script=Path(scratch)/'prepare-persistence'
+  source=SCRIPT.read_text()
+  assert '/proc/cmdline' in source
+  script.write_text(source.replace('/proc/cmdline',str(cmdline)))
+  p=subprocess.run(['/bin/bash','-c',stubs,'status-test',str(script)],env=env,capture_output=True,text=True)
   assert p.returncode != 0,(mode,p.stdout,p.stderr)
   status=dict(line.split('=',1) for line in (Path(scratch)/'persistence-status').read_text().splitlines())
   assert status['state']=='failed' and status['stage']==stage,(mode,status,p.stderr)
