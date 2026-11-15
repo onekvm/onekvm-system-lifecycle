@@ -300,15 +300,43 @@ module_seed_inputs() {
     find "$@" -type f -exec stat -c '%n %s %y %z' {} +
 }
 
+# Most transactions install other packages: they rewrite the status file but
+# leave the module packages' entries, including their install times, as they
+# were. Reading those entries is far cheaper than listing opkg's info
+# directory, and is needed only after the status file changed.
+module_packages() {
+    if [ -f "$opkg_root/status" ]; then
+        awk '/^Package: /{ keep = index($2, "onekvm-kernel-module-") == 1 } keep' \
+            "$opkg_root/status"
+    fi
+}
+only_other_packages_changed() {
+    [ -f "$module_seed_state" ] && [ -f "$module_packages_state" ] || return 1
+    cmp -s "$module_packages_current" "$module_packages_state" || return 1
+    status_record="$opkg_root/status "
+    [ "$(grep -vF "$status_record" "$module_seed_current")" = \
+      "$(grep -vF "$status_record" "$module_seed_state")" ]
+}
+
 if ! is_mounted "$module_updates"; then
     module_seed_state=${persistent_module_updates%/updates}/.onekvm-module-seed
+    module_packages_state=$module_seed_state-packages
     module_seed_current=/run/onekvm/.module-seed-inputs
+    module_packages_current=/run/onekvm/.module-seed-packages
     module_seed_inputs >"$module_seed_current"
     if [ ! -f "$module_seed_state" ] || ! cmp -s "$module_seed_current" "$module_seed_state"; then
-        slow_progress modules
-        seed_modules
+        module_packages >"$module_packages_current"
+        if ! only_other_packages_changed; then
+            slow_progress modules
+            seed_modules
+        fi
+        # Record the package entries first: a stale input record only
+        # repeats the comparison on the next boot.
+        cp "$module_packages_current" "$module_packages_state.tmp"
+        mv -f "$module_packages_state.tmp" "$module_packages_state"
         module_seed_inputs >"$module_seed_state.tmp"
         mv -f "$module_seed_state.tmp" "$module_seed_state"
+        rm -f "$module_packages_current"
     fi
     rm -f "$module_seed_current"
     mount --bind "$persistent_module_updates" "$module_updates"
