@@ -14,7 +14,7 @@ SCRIPT = Path(__file__).with_name('prepare-persistence')
 MAGIC = 'sha256:' + 'a' * 64
 SHELLS = [shell for shell in ('bash', 'dash') if shutil.which(shell)]
 # Commands logged by the fixture; all except mount run the real program.
-LOGGED = ('mount', 'cmp', 'cp', 'mkdir', 'rm', 'ln', 'mv', 'chmod', 'find', 'grep')
+LOGGED = ('mount', 'cmp', 'cp', 'mkdir', 'rm', 'ln', 'mv', 'chmod', 'find', 'grep', 'awk')
 
 
 class PersistenceTests(unittest.TestCase):
@@ -102,9 +102,21 @@ os.execv(shutil.which(name, path=path), [name] + sys.argv[1:])
             f'Package: onekvm-kernel-module-{name}\nX-OneKVM-Kernel-Magic: {magic}\n')
         return paths
 
-    def opkg_transaction(self):
-        status = self.opkg / 'status'
-        status.write_text(status.read_text() + 'Package: changed\n' if status.exists() else 'Package: changed\n')
+    def opkg_transaction(self, name='changed', version='1.0'):
+        """Install (or with version None remove) one package as opkg does:
+        rewrite the slot status, keeping every other entry and install time."""
+        installed = getattr(self, 'installed', {})
+        self.installed = installed
+        self.transactions = getattr(self, 'transactions', 0) + 1
+        if version is None:
+            installed.pop(name, None)
+        else:
+            installed[name] = (version, 1700000000 + self.transactions)
+        self.opkg.mkdir(parents=True, exist_ok=True)
+        (self.opkg / 'status').write_text(''.join(
+            f'Package: {package}\nVersion: {v}\nStatus: install ok installed\n'
+            f'Architecture: riscv64\nInstalled-Time: {t}\n\n'
+            for package, (v, t) in sorted(installed.items())))
 
     def immutable_module(self, module, data):
         path = Path(f'{self.immutable}{self.updates}/{module}')
@@ -122,6 +134,8 @@ os.execv(shutil.which(name, path=path), [name] + sys.argv[1:])
         status = (self.root / 'status/persistence-status').read_text()
         self.assertIn('state=ready', status)
         self.assertFalse((self.root / 'run/.module-seed-inputs').exists())
+        self.assertFalse((self.root / 'run/.module-seed-packages').exists())
+        self.assertFalse(list(self.persistent.parent.glob('.onekvm-module-seed-packages.tmp')))
         self.assertFalse(list(self.persistent.parent.glob('.onekvm-module-seed.tmp')))
         self.assertEqual((self.root / 'run/slot').read_text(), 'A\n')
         self.assertEqual(os.readlink(self.root / 'run/opkg'), str(self.opkg))
@@ -210,9 +224,56 @@ os.execv(shutil.which(name, path=path), [name] + sys.argv[1:])
             (installed,) = self.package(self.opkg / 'info', 'extra', 'extra/c.ko')
             installed.parent.mkdir(parents=True)
             installed.write_bytes(b'module c')
-            self.opkg_transaction()
+            self.opkg_transaction('onekvm-kernel-module-extra')
             self.boot(shell)
             self.assertEqual((self.persistent / 'extra/c.ko').read_bytes(), b'module c')
+            self.assertEqual(self.boot(shell), [])
+        self.each_shell(scenario)
+
+    def test_package_without_modules_skips_the_comparison(self):
+        def scenario(shell):
+            self.package(self.baseline, 'group', 'group/a.ko')
+            self.immutable_module('group/a.ko', b'module a')
+            self.boot(shell)
+            (installed,) = self.package(self.opkg / 'info', 'extra', 'extra/c.ko')
+            installed.parent.mkdir(parents=True)
+            installed.write_bytes(b'module c')
+            self.opkg_transaction('onekvm-kernel-module-extra')
+            self.boot(shell)
+            self.assertEqual(self.boot(shell), [])
+            # An application package: its own file list and a new status
+            # that keeps the module package's entry.
+            info = self.opkg / 'info'
+            (info / 'onekvm-ui.list').write_text('/usr/share/onekvm/web/index.html\n')
+            self.opkg_transaction('onekvm-ui')
+            self.assertEqual(self.boot(shell), [])
+            self.assertTrue([r for r in self.records if r[0] == 'awk'])
+            self.assertEqual(self.boot(shell), [])
+            self.assertFalse([r for r in self.records if r[0] == 'awk'])
+        self.each_shell(scenario)
+
+    def test_module_package_upgrade_and_removal_compare_again(self):
+        def scenario(shell):
+            self.package(self.baseline, 'group', 'group/a.ko')
+            self.immutable_module('group/a.ko', b'module a')
+            self.boot(shell)
+            (installed,) = self.package(self.opkg / 'info', 'extra', 'extra/c.ko')
+            installed.parent.mkdir(parents=True)
+            installed.write_bytes(b'module c')
+            self.opkg_transaction('onekvm-kernel-module-extra')
+            self.boot(shell)
+            self.assertEqual(self.boot(shell), [])
+            # A reinstall of the same version records a new install time.
+            self.opkg_transaction('onekvm-kernel-module-extra')
+            self.assertTrue(self.boot(shell))
+            self.assertEqual(self.boot(shell), [])
+            self.opkg_transaction('onekvm-kernel-module-extra', '2.0')
+            self.assertTrue(self.boot(shell))
+            self.assertEqual(self.boot(shell), [])
+            for suffix in ('list', 'control'):
+                (self.opkg / f'info/onekvm-kernel-module-extra.{suffix}').unlink()
+            self.opkg_transaction('onekvm-kernel-module-extra', None)
+            self.assertTrue(self.boot(shell))
             self.assertEqual(self.boot(shell), [])
         self.each_shell(scenario)
 
