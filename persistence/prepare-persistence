@@ -232,6 +232,10 @@ if [ "$slot_build_id" != "$current_build_id" ] || [ "$slot_kernel_magic" != "$ke
     rm -rf "$opkg_root"
     mkdir -p "$opkg_root"
     cp -a "$baseline/." "$opkg_root/"
+    # The markers declare the copy complete. A power cut after an f2fs
+    # checkpoint can keep them while the status file reads back as zeros, and
+    # no later boot would copy it again.
+    sync
     cp /usr/share/onekvm/build-id "$opkg_root/.baseline-build-id"
     printf '%s\n' "$kernel_magic" >"$opkg_root/.baseline-kernel-magic"
 fi
@@ -329,6 +333,9 @@ if ! is_mounted "$module_updates"; then
         if ! only_other_packages_changed; then
             slow_progress modules
             seed_modules
+            # The record below names these copies by size and time, which a
+            # copy cut off by power loss can already carry.
+            sync
         fi
         # Record the package entries first: a stale input record only
         # repeats the comparison on the next boot.
