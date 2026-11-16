@@ -173,6 +173,10 @@ if [ "$slot_build_id" != "$current_build_id" ] || [ "$slot_kernel_magic" != "$ke
     rm -rf "$opkg_root"
     mkdir -p "$opkg_root"
     cp -a "$baseline/." "$opkg_root/"
+    # The markers declare the copy complete. A power cut after an f2fs
+    # checkpoint can keep them while the status file reads back as zeros, and
+    # no later boot would copy it again.
+    sync
     cp /usr/share/onekvm/build-id "$opkg_root/.baseline-build-id"
     printf '%s\n' "$kernel_magic" >"$opkg_root/.baseline-kernel-magic"
 fi
