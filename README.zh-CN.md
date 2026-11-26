@@ -5,13 +5,16 @@
 OneKVM 平台无关的系统生命周期支持。本仓库当前负责跨目标平台使用的持久化
 配置、扩展状态、软件包状态、内核模块更新、存储准备，以及进程看门狗。
 看门狗订阅 `org.onekvm.Core1.Watchdog.Heartbeat`（Core 最少 10 秒一次）。
-进程心跳静默 60 秒后可采集 `/proc` 堆栈，再执行 `sync && reboot -f`。
-显示器关闭或采集 0 FPS 不视为卡死。重启次数用持久计数而不是墙钟，
-因为 NanoKVM 没有电池 RTC。同一进程打开 `/dev/watchdog0` 并每 5 秒
-keepalive（默认硬件超时 60 秒，不超过 DesignWare 上限，避免内核代喂）。
-`systemctl stop` 会 magic-close。进程崩溃或 SIGKILL 则保持硬件武装。
-不要设置 systemd `RuntimeWatchdogSec`（设备只能被打开一次）。
-自动执行 `sync && reboot -f` 时保留硬件看门狗，以便同步或重启卡住时仍能复位。
+进程心跳静默 60 秒后可采集 `/proc` 堆栈到
+`/var/log/onekvm/watchdog-last.dump`，再让内核 panic。`panic=10`
+大约 10 秒后重启。显示器关闭或采集 0 FPS 不视为卡死。panic 次数用
+持久计数而不是墙钟，因为 NanoKVM 没有电池 RTC。同一进程打开
+`/dev/watchdog0` 并每 5 秒 keepalive（默认硬件超时 60 秒，不超过
+DesignWare 上限，避免内核代喂）。`systemctl stop` 会 magic-close。
+进程崩溃或 SIGKILL 则保持硬件武装。不要设置 systemd
+`RuntimeWatchdogSec`（设备只能被打开一次）。panic 期间硬件看门狗保持
+武装。CPU 卡在一次未完成的 MMIO 时不会执行这次 panic，硬件定时器仍会
+复位，且不会更新 dump 文件。
 
 机器专用的分区创建、首次启动迁移和硬件健康检查保留在对应机器支持仓库中。
 

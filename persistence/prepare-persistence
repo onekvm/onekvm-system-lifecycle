@@ -1,6 +1,12 @@
 #!/bin/sh
 set -eu
 
+# This runs on the boot critical path while many units share one slow core, so
+# each extra process costs tens of milliseconds. An ordinary boot only restores
+# runtime state that does not survive a restart: the package key copy, the bind
+# mounts and the /run links. Migration, package state and module seeding run
+# only when the image, kernel, slot or package state changed.
+
 # Keep failure context in RAM even when userdata cannot be written. No logs or
 # credentials are copied here; the local screen can read this without Core.
 stage=boot-slot
@@ -8,13 +14,18 @@ status_root=${ONEKVM_PERSISTENCE_STATUS_DIR:-/run/onekvm}
 write_status() {
     (
         umask 077
-        mkdir -p "$status_root"
+        [ -d "$status_root" ] || mkdir -p "$status_root"
         printf 'state=%s\nstage=%s\nexit_code=%s\n' "$1" "$stage" "$2" \
             >"$status_root/.persistence-status.tmp"
         mv -f "$status_root/.persistence-status.tmp" "$status_root/persistence-status"
     ) 2>/dev/null || :
 }
+# A failure reports the stage it stopped in. Only stages that copy or compare
+# files publish their name while running, so a long stall stays visible.
 progress() {
+    stage=$1
+}
+slow_progress() {
     stage=$1
     write_status running 0
 }
@@ -33,26 +44,62 @@ on_exit() {
 trap on_exit EXIT
 write_status running 0
 
+# Read the first line of a file without a process. Missing files read as empty.
+read_line() {
+    line=
+    if [ -r "$1" ]; then
+        IFS= read -r line <"$1" || :
+    fi
+}
+# Like mountpoint -q, without a process. The paths used here contain no
+# symlinks or characters that mountinfo escapes.
+is_mounted() {
+    while read -r _ _ _ _ mount_point _; do
+        [ "$mount_point" != "$1" ] || return 0
+    done </proc/self/mountinfo
+    return 1
+}
+# Create the directories only when one is missing.
+ensure_directories() {
+    for directory in "$@"; do
+        if [ ! -d "$directory" ]; then
+            mkdir -p "$@"
+            return 0
+        fi
+    done
+}
+
 slot=
-for argument in $(cat /proc/cmdline); do
+read_line /proc/cmdline
+for argument in $line; do
     case "$argument" in
         rauc.slot=A) slot=A ;;
         rauc.slot=B) slot=B ;;
         onekvm.nfsroot=1) slot=dev ;;
     esac
 done
+# Go keeps its factory bootloader; its initramfs publishes the selected root.
+# The marker is created before switch_root in the root-owned runtime tmpfs.
+read_line /usr/share/onekvm/machine
+if [ "$line" = nanokvm-go ] && [ -r /run/onekvm/boot-slot ]; then
+    IFS= read -r slot </run/onekvm/boot-slot
+    case "$slot" in A|dev) ;; *) echo "invalid Go boot slot" >&2; exit 1 ;; esac
+fi
 [ -n "$slot" ] || { echo "missing rauc.slot" >&2; exit 1; }
 
 data_root=/data/onekvm
 storage_root=/mnt/storage/onekvm
 config_root=$storage_root/config
 config_marker=$storage_root/.etc-migrated
-kernel_release=$(uname -r)
+read_line /proc/sys/kernel/osrelease
+kernel_release=$line
+[ -n "$kernel_release" ] || { echo "missing kernel release" >&2; exit 1; }
 module_updates=/usr/lib/modules/$kernel_release/updates
 persistent_module_updates=$storage_root/kernel-modules/$slot/$kernel_release/updates
 kernel_magic=
 if [ -f /usr/share/onekvm/kernel-magic ]; then
-    kernel_magic=$(cat /usr/share/onekvm/kernel-magic)
+    read_line /usr/share/onekvm/kernel-magic
+    kernel_magic=$line
     kernel_hash=${kernel_magic#sha256:}
     case "$kernel_hash" in
         ''|*[!0-9a-f]*) echo 'invalid image kernel magic' >&2; exit 1 ;;
@@ -71,28 +118,33 @@ immutable_root=/mnt/.rofs
 [ -d "$immutable_root/usr" ] || immutable_root=/rofs
 
 progress runtime
-mkdir -p /run/onekvm
-rm -rf /run/onekvm/opkg-gpg
-mkdir -p /run/onekvm/opkg-gpg
-chmod 0700 /run/onekvm/opkg-gpg
+# /run starts empty; a manual rerun replaces the previous key copy.
+if [ -e /run/onekvm/opkg-gpg ]; then
+    rm -rf /run/onekvm/opkg-gpg
+fi
+mkdir -p -m 0700 /run/onekvm/opkg-gpg
 progress package-keys
 cp -a /etc/opkg/gpg/. /run/onekvm/opkg-gpg/
 chmod 0600 /run/onekvm/opkg-gpg/pubring.kbx \
     /run/onekvm/opkg-gpg/trustdb.gpg
 
 progress config
-mkdir -p "$config_root"
-if [ ! -e "$config_marker" ]; then
-    if [ ! -L /etc/onekvm ] || [ "$(readlink /etc/onekvm)" != "$config_root" ]; then
-        cp -a /etc/onekvm/. "$config_root/"
+# /etc lives in the root overlay, so a migrated link survives a restart.
+if [ ! -e "$config_marker" ] || [ ! -L /etc/onekvm ] ||
+   [ ! /etc/onekvm -ef "$config_root" ]; then
+    mkdir -p "$config_root"
+    if [ ! -e "$config_marker" ]; then
+        if [ ! -L /etc/onekvm ] || [ "$(readlink /etc/onekvm)" != "$config_root" ]; then
+            cp -a /etc/onekvm/. "$config_root/"
+        fi
+        : >"$config_marker"
     fi
-    : >"$config_marker"
+    rm -rf /etc/onekvm
+    ln -s "$config_root" /etc/onekvm
 fi
-rm -rf /etc/onekvm
-ln -s "$config_root" /etc/onekvm
 
 progress data
-mkdir -p \
+ensure_directories \
     "$data_root/apps" \
     "$data_root/app-data/core" \
     "$config_root/extensions" \
@@ -106,10 +158,10 @@ chmod 0700 "$config_root/extensions"
 # dangling directory symlink. Leave their creation to that service then.
 progress volatile
 if [ -d /var/log ]; then
-    mkdir -p /var/log/onekvm
+    ensure_directories /var/log/onekvm
 fi
 if [ -d /var/tmp ]; then
-    mkdir -p /var/tmp/onekvm/extension-uploads
+    ensure_directories /var/tmp/onekvm/extension-uploads
     chmod 0700 /var/tmp/onekvm /var/tmp/onekvm/extension-uploads
 fi
 
@@ -118,8 +170,8 @@ fi
 # use another overlayfs mount as its upper layer.  Preserve existing machine
 # images by copying them once before hiding the old root-overlay directory.
 progress machines
-mkdir -p "$machines_mount" "$machines_root"
-if ! mountpoint -q "$machines_mount"; then
+ensure_directories "$machines_mount" "$machines_root"
+if ! is_mounted "$machines_mount"; then
     if [ ! -e "$machines_marker" ]; then
         cp -a "$machines_mount/." "$machines_root/"
         : >"$machines_marker"
@@ -133,21 +185,28 @@ if [ ! -e /etc/opkg/onekvm-feed.conf ]; then
 fi
 
 progress build-id
-current_build_id=$(cat /usr/share/onekvm/build-id)
-slot_build_id=
-if [ -f "$opkg_root/.baseline-build-id" ]; then
-    slot_build_id=$(cat "$opkg_root/.baseline-build-id")
+read_line /usr/share/onekvm/build-id
+current_build_id=$line
+[ -n "$current_build_id" ] || { echo "missing image build ID" >&2; exit 1; }
+read_line "$opkg_root/.baseline-build-id"
+slot_build_id=$line
+read_line "$opkg_root/.baseline-kernel-magic"
+slot_kernel_magic=$line
+# These markers live only in the overlay upper. The initramfs writes them after
+# retiring every image-owned upper entry, so lower files are already visible.
+upper_refreshed=false
+read_line /.onekvm-image-build-id
+image_build_id=$line
+read_line /.onekvm-kernel-magic
+if [ "$image_build_id" = "$current_build_id" ] && [ "$line" = "$kernel_magic" ]; then
+    upper_refreshed=true
 fi
-
-slot_kernel_magic=
-if [ -f "$opkg_root/.baseline-kernel-magic" ]; then
-    slot_kernel_magic=$(cat "$opkg_root/.baseline-kernel-magic")
-fi
-if [ "$slot_build_id" != "$current_build_id" ] || [ "$slot_kernel_magic" != "$kernel_magic" ]; then
+if [ "$upper_refreshed" = false ] &&
+   { [ "$slot_build_id" != "$current_build_id" ] || [ "$slot_kernel_magic" != "$kernel_magic" ]; }; then
     # The root overlay is shared by A/B slots, so an older package payload can
     # hide a newer immutable file. Refresh only regular baseline files that
     # differ; leave local content and the slot-aware module tree alone.
-    progress image-files
+    slow_progress image-files
     for package_list in "$baseline"/info/*.list; do
         [ -f "$package_list" ] || continue
         while read -r installed_path _; do
@@ -169,7 +228,7 @@ if [ "$slot_build_id" != "$current_build_id" ] || [ "$slot_kernel_magic" != "$ke
 fi
 
 if [ "$slot_build_id" != "$current_build_id" ] || [ "$slot_kernel_magic" != "$kernel_magic" ]; then
-    progress packages
+    slow_progress packages
     rm -rf "$opkg_root"
     mkdir -p "$opkg_root"
     cp -a "$baseline/." "$opkg_root/"
@@ -191,11 +250,12 @@ fi
 # image baseline or this slot rather than copying arbitrary stale files from a
 # root overlay that may previously have been shared by both slots.
 progress modules
-mkdir -p "$module_updates" "$persistent_module_updates"
-if ! mountpoint -q "$module_updates"; then
+ensure_directories "$module_updates" "$persistent_module_updates"
+
+seed_modules() {
     # Seed modules shipped by the current immutable image as well as modules
-    # installed later by extension bundles.  Repeat the comparison on every
-    # boot because successive images can intentionally share uname -r.
+    # installed later by extension bundles.  Successive images can intentionally
+    # share uname -r, so compare contents whenever the recorded inputs differ.
     for package_list in \
         "$baseline"/info/onekvm-kernel-module-*.list \
         "$opkg_root"/info/onekvm-kernel-module-*.list; do
@@ -226,6 +286,66 @@ if ! mountpoint -q "$module_updates"; then
             esac
         done <"$package_list"
     done
+}
+
+# Comparing every module takes seconds, and an ordinary reboot changes none of
+# its inputs: the image build ID and kernel magic name the immutable modules,
+# opkg rewrites the slot status on every install or removal, and the persistent
+# copies carry their own size and times. Times include nanoseconds and a copy
+# gets a new ctime, so replaced or removed copies also count as a change.
+# Record these after a complete pass and repeat it only when they differ.
+module_seed_inputs() {
+    printf 'version=2\nslot=%s\nkernel=%s\nkernel_magic=%s\nbuild_id=%s\n' \
+        "$slot" "$kernel_release" "$kernel_magic" "$current_build_id"
+    set -- "$persistent_module_updates"
+    if [ -f "$opkg_root/status" ]; then
+        set -- "$opkg_root/status" "$@"
+    fi
+    find "$@" -type f -exec stat -c '%n %s %y %z' {} +
+}
+
+# Most transactions install other packages: they rewrite the status file but
+# leave the module packages' entries, including their install times, as they
+# were. Reading those entries is far cheaper than listing opkg's info
+# directory, and is needed only after the status file changed.
+module_packages() {
+    if [ -f "$opkg_root/status" ]; then
+        awk '/^Package: /{ keep = index($2, "onekvm-kernel-module-") == 1 } keep' \
+            "$opkg_root/status"
+    fi
+}
+only_other_packages_changed() {
+    [ -f "$module_seed_state" ] && [ -f "$module_packages_state" ] || return 1
+    cmp -s "$module_packages_current" "$module_packages_state" || return 1
+    status_record="$opkg_root/status "
+    [ "$(grep -vF "$status_record" "$module_seed_current")" = \
+      "$(grep -vF "$status_record" "$module_seed_state")" ]
+}
+
+if ! is_mounted "$module_updates"; then
+    module_seed_state=${persistent_module_updates%/updates}/.onekvm-module-seed
+    module_packages_state=$module_seed_state-packages
+    module_seed_current=/run/onekvm/.module-seed-inputs
+    module_packages_current=/run/onekvm/.module-seed-packages
+    module_seed_inputs >"$module_seed_current"
+    if [ ! -f "$module_seed_state" ] || ! cmp -s "$module_seed_current" "$module_seed_state"; then
+        module_packages >"$module_packages_current"
+        if ! only_other_packages_changed; then
+            slow_progress modules
+            seed_modules
+            # The record below names these copies by size and time, which a
+            # copy cut off by power loss can already carry.
+            sync
+        fi
+        # Record the package entries first: a stale input record only
+        # repeats the comparison on the next boot.
+        cp "$module_packages_current" "$module_packages_state.tmp"
+        mv -f "$module_packages_state.tmp" "$module_packages_state"
+        module_seed_inputs >"$module_seed_state.tmp"
+        mv -f "$module_seed_state.tmp" "$module_seed_state"
+        rm -f "$module_packages_current"
+    fi
+    rm -f "$module_seed_current"
     mount --bind "$persistent_module_updates" "$module_updates"
     # The module-preparation unit validates indexes after staged package
     # installation, before Core. Do not rebuild them unconditionally here:
